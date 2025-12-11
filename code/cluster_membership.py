@@ -29,9 +29,13 @@ try:  # scienceplots is optional; fallback to default styles if unavailable
 except Exception:  # pragma: no cover - optional dependency
     _HAS_SCIENCEPLOTS = False
 from scipy.sparse import csgraph
+from scipy.sparse.csgraph import connected_components, minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from scipy.stats import chi2
+from sklearn.covariance import MinCovDet
 from sklearn.metrics import pairwise_distances
 from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 
 try:  # Optional: real Lindegren zero-point tables if available
     from zero_point import zpt
@@ -54,6 +58,9 @@ _REQUIRED_COLUMNS = {
     "phot_g_mean_mag",
     "bp_rp",
     "phot_bp_rp_excess_factor",
+    "ruwe",
+    "visibility_periods_used",
+    "matched_transits",
 }
 
 
@@ -202,6 +209,13 @@ class ClusterMembership:
             warnings.warn("Input catalogue is empty; skipping preprocessing.")
             self.data = df
             return df
+
+        df = df[
+            (df["phot_g_mean_mag"] < 21)
+            & (df["ruwe"] < 1.4)
+            & (df["visibility_periods_used"] > 9)
+            & (df["matched_transits"] > 5)
+        ]
 
         df["parallax_corr"] = self.lindegren_zpt(df["parallax"], df["phot_g_mean_mag"], df["bp_rp"])
         df["c_star"] = self.riello_cstar(df["phot_bp_rp_excess_factor"], df["bp_rp"])
@@ -393,6 +407,235 @@ class ClusterMembership:
         return plot_df
 
 
+class ScientificClusterPipeline:
+    """Alternative end-to-end membership pipeline using MST + Mahalanobis + GMM.
+
+    This class implements the multi-stage workflow supplied by the science
+    team that chains a robustly scaled minimum-spanning-tree selection with a
+    Mahalanobis-distance clip and a smartly initialised Gaussian Mixture
+    Model. It is intentionally lightweight and uses simple ``print`` logging so
+    it can be dropped into exploratory notebooks.
+    """
+
+    def __init__(self, df: pd.DataFrame, center_params: dict) -> None:
+        self.raw_data = df.copy()
+        self.data = df.copy()
+        self.center = center_params
+        self.stats: dict[str, int] = {"init": len(df)}
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _riello_correction(bp_rp: pd.Series, excess: pd.Series) -> np.ndarray:
+        """Riello et al. (2021) flux-excess correction."""
+
+        bp_rp_arr = np.array(bp_rp, dtype=float)
+        excess_arr = np.array(excess, dtype=float)
+        correction = np.zeros_like(bp_rp_arr)
+        valid = ~np.isnan(bp_rp_arr)
+
+        mask_blue = valid & (bp_rp_arr < 0.5)
+        mask_green = valid & (bp_rp_arr >= 0.5) & (bp_rp_arr < 4.0)
+        mask_red = valid & (bp_rp_arr > 4.0)
+
+        correction[mask_blue] = (
+            1.154360
+            + 0.033772 * bp_rp_arr[mask_blue]
+            + 0.032277 * (bp_rp_arr[mask_blue] ** 2)
+        )
+        correction[mask_green] = (
+            1.162004
+            + 0.011464 * bp_rp_arr[mask_green]
+            + 0.049255 * (bp_rp_arr[mask_green] ** 2)
+            - 0.005879 * (bp_rp_arr[mask_green] ** 3)
+        )
+        correction[mask_red] = 1.057572 + 0.140537 * bp_rp_arr[mask_red]
+        return excess_arr - correction
+
+    @staticmethod
+    def _sigma_cstar(g_mag: pd.Series) -> np.ndarray:
+        """Intrinsic scatter of the C* diagnostic (Riello et al. 2021, Eq. 18)."""
+
+        g_mag_arr = np.array(g_mag, dtype=float)
+        return 0.0059898 + 8.817481e-12 * (g_mag_arr ** 7.618399)
+
+    # ------------------------------------------------------------------
+    def preprocess_data(self) -> "ScientificClusterPipeline":
+        """Apply zero-point, photometric, and astrometric quality cuts."""
+
+        print(f"1. Preprocessing... Input: {len(self.data)}")
+
+        cols_zpt = [
+            "phot_g_mean_mag",
+            "ecl_lat",
+            "nu_eff_used_in_astrometry",
+            "pseudocolour",
+            "astrometric_params_solved",
+        ]
+        if _HAS_ZPT and all(c in self.data.columns for c in cols_zpt):
+            self.data["zpt"] = zpt.get_zpt(
+                phot_g_mean_mag=self.data["phot_g_mean_mag"].values,
+                ecl_lat=self.data["ecl_lat"].values,
+                nu_eff_used_in_astrometry=self.data["nu_eff_used_in_astrometry"].values,
+                pseudocolour=self.data["pseudocolour"].values,
+                astrometric_params_solved=self.data["astrometric_params_solved"].values,
+            )
+            self.data["parallax_correction"] = self.data["parallax"] - self.data["zpt"]
+        else:
+            self.data["parallax_correction"] = self.data["parallax"]
+
+        if "bp_rp" in self.data.columns:
+            self.data["C_star"] = self._riello_correction(
+                self.data["bp_rp"], self.data["phot_bp_rp_excess_factor"]
+            )
+            self.data["sigma_C_star"] = self._sigma_cstar(self.data["phot_g_mean_mag"])
+            mask_phot = np.abs(self.data["C_star"]) < 5 * self.data["sigma_C_star"]
+        else:
+            mask_phot = np.ones(len(self.data), dtype=bool)
+
+        mask_qual = (self.data["parallax"] > 0) & (
+            (self.data["parallax"] / self.data["parallax_error"]) >= 5.0
+        )
+
+        self.data = self.data[mask_phot & mask_qual].dropna(
+            subset=["ra", "dec", "parallax", "pmra", "pmdec"]
+        )
+        self.stats["cleaned"] = len(self.data)
+        return self
+
+    def coarse_filter(self, pm_sigma: float = 9.0, plx_sigma: float = 10.0) -> "ScientificClusterPipeline":
+        """Apply coarse proper motion and parallax cuts around a supplied centre."""
+
+        if "cleaned" not in self.stats:
+            self.preprocess_data()
+
+        pmra_err = self.center.get("pmra_error", 0.1)
+        pmdec_err = self.center.get("pmdec_error", 0.1)
+        plx_err = self.center.get("parallax_error", 0.1)
+
+        pm_tol = pm_sigma * np.sqrt((pmra_err**2 + pmdec_err**2) / 2)
+        plx_tol = plx_sigma * plx_err
+
+        mask_pm = np.sqrt(
+            (self.data["pmra"] - self.center["pmra"]) ** 2
+            + (self.data["pmdec"] - self.center["pmdec"]) ** 2
+        ) <= pm_tol
+        mask_plx = np.abs(self.data["parallax"] - self.center["parallax"]) <= plx_tol
+
+        self.data = self.data[mask_pm & mask_plx]
+        self.stats["coarse"] = len(self.data)
+        print(f"2. Coarse Filter: Count {len(self.data)}")
+        return self
+
+    def apply_mst(self, cut_sigma: float = 3.0) -> "ScientificClusterPipeline":
+        """Minimum-spanning-tree selection with robust scaling."""
+
+        if "coarse" not in self.stats:
+            self.coarse_filter()
+
+        df_mst = self.data.copy().reset_index(drop=True)
+        scale_params = ["ra", "dec", "parallax_correction"]
+
+        scaler = RobustScaler()
+        X_scaled = scaler.fit_transform(df_mst[scale_params])
+
+        dist_matrix = squareform(pdist(X_scaled, metric="euclidean"))
+        mst_matrix = minimum_spanning_tree(dist_matrix)
+
+        edges = mst_matrix.data
+        mu = np.mean(edges)
+        sigma = np.std(edges)
+        threshold = mu + (cut_sigma * sigma)
+
+        mst_dense = mst_matrix.toarray()
+        mst_dense[mst_dense > threshold] = 0
+        n_components, labels = connected_components(mst_dense, directed=False)
+
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        if len(counts) == 0:
+            return self
+        main_label = unique_labels[np.argmax(counts)]
+
+        self.data = df_mst[labels == main_label].copy()
+        self.stats["mst"] = len(self.data)
+        print(f"3. MST (Robust): Threshold {threshold:.3f}, Count {len(self.data)}")
+        return self
+
+    def apply_mahalanobis_clipping(self, confidence: float = 0.997) -> "ScientificClusterPipeline":
+        """Outlier rejection using a robust Mahalanobis distance cut."""
+
+        if "mst" not in self.stats:
+            self.apply_mst()
+
+        features = ["ra", "dec", "parallax_correction", "pmra", "pmdec"]
+        X = self.data[features].values
+
+        try:
+            robust_cov = MinCovDet().fit(X)
+            m_dist = robust_cov.mahalanobis(X)
+
+            threshold = np.sqrt(chi2.ppf(confidence, df=len(features)))
+
+            self.data = self.data[m_dist < threshold]
+            print(f"4. Mahalanobis Clip: Threshold {threshold:.2f}, Count {len(self.data)}")
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            print(
+                "   ⚠️ Mahalanobis fitting failed (likely too few stars). Falling back "
+                f"to Sigma Clip. Error: {exc}"
+            )
+            self.apply_sigma_clipping()
+
+        self.stats["mahalanobis"] = len(self.data)
+        return self
+
+    def apply_sigma_clipping(self, sigma: float = 3.0) -> "ScientificClusterPipeline":
+        """Fallback multivariate sigma clipping."""
+
+        cols = ["ra", "dec", "parallax_correction", "pmra", "pmdec"]
+        z = np.abs((self.data[cols] - self.data[cols].mean()) / self.data[cols].std())
+        self.data = self.data[(z < sigma).all(axis=1)]
+        return self
+
+    def apply_gmm(self, prob_threshold: float = 0.8) -> pd.DataFrame:
+        """Two-component GMM with smart initialisation for cluster vs. field."""
+
+        if "mahalanobis" not in self.stats:
+            self.apply_mahalanobis_clipping()
+
+        features = ["ra", "dec", "parallax_correction", "pmra", "pmdec"]
+        X = self.data[features].values
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        cluster_mean = np.mean(X_scaled, axis=0)
+        field_offset = np.std(X_scaled, axis=0)
+
+        means_init = np.vstack([cluster_mean, cluster_mean + field_offset])
+
+        gmm = GaussianMixture(
+            n_components=2,
+            means_init=means_init,
+            weights_init=[0.6, 0.4],
+            random_state=42,
+        )
+        gmm.fit(X_scaled)
+
+        probs = gmm.predict_proba(X_scaled)
+
+        det_covs = [np.linalg.det(cov) for cov in gmm.covariances_]
+        cluster_label = int(np.argmin(det_covs))
+
+        self.data["gmm_prob"] = probs[:, cluster_label]
+        self.data["cluster_pred_num"] = (gmm.predict(X_scaled) == cluster_label).astype(int)
+
+        final_members = self.data[
+            (self.data["cluster_pred_num"] == 1) & (self.data["gmm_prob"] >= prob_threshold)
+        ].copy()
+
+        self.stats["final"] = len(final_members)
+        print(f"5. GMM (Smart Init): Members {len(final_members)} (P>={prob_threshold})")
+        return final_members
+
+
 class ClusterPlots:
     """Visualization utilities for cluster membership products."""
 
@@ -475,4 +718,4 @@ class ClusterPlots:
         return ax
 
 
-__all__ = ["ClusterMembership", "ClusterPlots"]
+__all__ = ["ClusterMembership", "ClusterPlots", "ScientificClusterPipeline"]
